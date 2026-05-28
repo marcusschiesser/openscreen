@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Languages } from "lucide-react";
+import { Check, ChevronDown, Languages, RadioTower } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { BsPauseCircle, BsPlayCircle, BsRecordCircle } from "react-icons/bs";
@@ -24,14 +24,21 @@ import { getAvailableLocales, getLocaleName } from "@/i18n/loader";
 import { nativeBridgeClient } from "@/native";
 import { useAudioLevelMeter } from "../../hooks/useAudioLevelMeter";
 import { useCameraDevices } from "../../hooks/useCameraDevices";
+import { useLiveStreamer } from "../../hooks/useLiveStreamer";
 import { useMicrophoneDevices } from "../../hooks/useMicrophoneDevices";
 import { useScreenRecorder } from "../../hooks/useScreenRecorder";
+import {
+	DEFAULT_LIVE_STREAM_LAYOUT,
+	type LiveStreamLayout,
+	type LiveStreamStartConfig,
+} from "../../lib/liveStream";
 import { requestCameraAccess } from "../../lib/requestCameraAccess";
 import { formatTimePadded } from "../../utils/timeUtils";
 import { AudioLevelMeter } from "../ui/audio-level-meter";
 import { Button } from "../ui/button";
 import { Tooltip } from "../ui/tooltip";
 import styles from "./LaunchWindow.module.css";
+import { LiveStreamSetupDialog } from "./LiveStreamSetupDialog";
 
 const ICON_SIZE = 20;
 
@@ -51,6 +58,7 @@ const ICON_CONFIG = {
 	restart: { icon: MdRestartAlt, size: ICON_SIZE },
 	cancel: { icon: MdCancel, size: ICON_SIZE },
 	record: { icon: BsRecordCircle, size: ICON_SIZE },
+	live: { icon: RadioTower, size: ICON_SIZE },
 	videoFile: { icon: MdVideoFile, size: ICON_SIZE },
 	folder: { icon: FaFolderOpen, size: ICON_SIZE },
 	minimize: { icon: FiMinus, size: ICON_SIZE },
@@ -116,9 +124,16 @@ export function LaunchWindow() {
 		cursorCaptureMode,
 		setCursorCaptureMode,
 	} = useScreenRecorder();
+	const { streaming, streamElapsedSeconds, startLiveStream, stopLiveStream } = useLiveStreamer({
+		systemAudioEnabled,
+		microphoneEnabled,
+		microphoneDeviceId,
+		webcamEnabled,
+		webcamDeviceId,
+	});
 
-	const showMicControls = microphoneEnabled && !recording;
-	const showWebcamControls = webcamEnabled && !recording;
+	const showMicControls = microphoneEnabled && !recording && !streaming;
+	const showWebcamControls = webcamEnabled && !recording && !streaming;
 
 	const [isMicHovered, setIsMicHovered] = useState(false);
 	const [isMicFocused, setIsMicFocused] = useState(false);
@@ -302,19 +317,36 @@ export function LaunchWindow() {
 		setHudMouseEventsEnabled(isLanguageMenuOpen);
 	}, [isLanguageMenuOpen, setHudMouseEventsEnabled]);
 
-	const [selectedSource, setSelectedSource] = useState("Screen");
+	const [selectedSource, setSelectedSource] = useState<ProcessedDesktopSource | null>(null);
 	const [hasSelectedSource, setHasSelectedSource] = useState(false);
 	const [, setRecordPointerDownCount] = useState(0);
+	const [liveSetupOpen, setLiveSetupOpen] = useState(false);
+	const [liveSetupPreparing, setLiveSetupPreparing] = useState(false);
+	const [liveStreamLayout, setLiveStreamLayout] = useState<LiveStreamLayout>(
+		DEFAULT_LIVE_STREAM_LAYOUT,
+	);
+	const selectedSourceLabel = selectedSource?.name ?? t("sourceSelector.defaultSourceName");
+
+	useEffect(() => {
+		window.electronAPI?.setHudOverlayExpanded?.(liveSetupOpen);
+		setHudMouseEventsEnabled(liveSetupOpen || isLanguageMenuOpen);
+	}, [isLanguageMenuOpen, liveSetupOpen, setHudMouseEventsEnabled]);
+
+	useEffect(() => {
+		return () => {
+			window.electronAPI?.setHudOverlayExpanded?.(false);
+		};
+	}, []);
 
 	useEffect(() => {
 		const checkSelectedSource = async () => {
 			if (window.electronAPI) {
 				const source = await window.electronAPI.getSelectedSource();
 				if (source) {
-					setSelectedSource(source.name);
+					setSelectedSource(source);
 					setHasSelectedSource(true);
 				} else {
-					setSelectedSource("Screen");
+					setSelectedSource(null);
 					setHasSelectedSource(false);
 				}
 			}
@@ -349,6 +381,39 @@ export function LaunchWindow() {
 		}
 	};
 
+	const handleStartLiveStream = async (config: LiveStreamStartConfig) => {
+		try {
+			return await startLiveStream(config);
+		} catch (error) {
+			console.warn("Failed to start live stream:", error);
+			return false;
+		}
+	};
+
+	const openLiveStreamSetup = async () => {
+		if (streaming) {
+			void stopLiveStream();
+			return;
+		}
+
+		if (!hasSelectedSource || liveSetupPreparing) {
+			return;
+		}
+
+		setLiveSetupPreparing(true);
+		try {
+			const refreshedSource = await window.electronAPI?.captureSelectedSourcePreview?.();
+			if (refreshedSource) {
+				setSelectedSource(refreshedSource);
+			}
+		} catch (error) {
+			console.warn("Unable to refresh live stream preview source:", error);
+		} finally {
+			setLiveSetupPreparing(false);
+			setLiveSetupOpen(true);
+		}
+	};
+
 	const openProjectFile = async () => {
 		const result = await nativeBridgeClient.project.loadProjectFile();
 		if (result.canceled || !result.success) return;
@@ -367,7 +432,7 @@ export function LaunchWindow() {
 	};
 
 	const toggleMicrophone = () => {
-		if (!recording) {
+		if (!recording && !streaming) {
 			setMicrophoneEnabled(!microphoneEnabled);
 		}
 	};
@@ -403,13 +468,17 @@ export function LaunchWindow() {
 		<div
 			className={`h-full w-full min-w-0 max-w-full overflow-x-hidden overflow-y-hidden bg-transparent ${styles.electronDrag}`}
 			onPointerMove={(event) => {
+				if (liveSetupOpen) {
+					setHudMouseEventsEnabled(true);
+					return;
+				}
 				const target = event.target as HTMLElement | null;
 				const shouldCapture =
 					isLanguageMenuOpen || Boolean(target?.closest("[data-hud-interactive='true']"));
 				setHudMouseEventsEnabled(shouldCapture);
 			}}
 			onPointerLeave={() => {
-				if (!isLanguageMenuOpen) {
+				if (!isLanguageMenuOpen && !liveSetupOpen) {
 					setHudMouseEventsEnabled(false);
 				}
 			}}
@@ -594,7 +663,7 @@ export function LaunchWindow() {
 				onPointerDown={() => setHudMouseEventsEnabled(true)}
 				onMouseEnter={() => setHudMouseEventsEnabled(true)}
 				onMouseLeave={() => {
-					if (!isLanguageMenuOpen) {
+					if (!isLanguageMenuOpen && !liveSetupOpen) {
 						setHudMouseEventsEnabled(false);
 					}
 				}}
@@ -614,12 +683,12 @@ export function LaunchWindow() {
 				<button
 					className={`${hudGroupClasses} h-8 px-2.5 ${styles.electronNoDrag}`}
 					onClick={openSourceSelector}
-					disabled={recording}
-					title={selectedSource}
+					disabled={recording || streaming}
+					title={selectedSourceLabel}
 				>
 					{getIcon("monitor", "text-white/80")}
 					<span className="max-w-[86px] truncate text-[11px] font-medium text-white/75">
-						{selectedSource}
+						{selectedSourceLabel}
 					</span>
 				</button>
 
@@ -628,8 +697,8 @@ export function LaunchWindow() {
 					<button
 						data-testid="launch-system-audio-button"
 						className={`${hudIconBtnClasses} ${systemAudioEnabled ? "drop-shadow-[0_0_4px_rgba(74,222,128,0.4)]" : ""}`}
-						onClick={() => !recording && setSystemAudioEnabled(!systemAudioEnabled)}
-						disabled={recording}
+						onClick={() => !recording && !streaming && setSystemAudioEnabled(!systemAudioEnabled)}
+						disabled={recording || streaming}
 						title={
 							systemAudioEnabled ? t("audio.disableSystemAudio") : t("audio.enableSystemAudio")
 						}
@@ -642,7 +711,7 @@ export function LaunchWindow() {
 						data-testid="launch-microphone-button"
 						className={`${hudIconBtnClasses} ${microphoneEnabled ? "drop-shadow-[0_0_4px_rgba(74,222,128,0.4)]" : ""}`}
 						onClick={toggleMicrophone}
-						disabled={recording}
+						disabled={recording || streaming}
 						title={microphoneEnabled ? t("audio.disableMicrophone") : t("audio.enableMicrophone")}
 						onPointerDown={() => {
 							setRecordPointerDownCount((count) => count + 1);
@@ -656,9 +725,11 @@ export function LaunchWindow() {
 						data-testid="launch-webcam-button"
 						className={`${hudIconBtnClasses} ${webcamEnabled ? "drop-shadow-[0_0_4px_rgba(74,222,128,0.4)]" : ""}`}
 						onClick={async () => {
-							await setWebcamEnabled(!webcamEnabled);
+							if (!streaming) {
+								await setWebcamEnabled(!webcamEnabled);
+							}
 						}}
-						disabled={recording}
+						disabled={recording || streaming}
 						title={webcamEnabled ? t("webcam.disableWebcam") : t("webcam.enableWebcam")}
 					>
 						{webcamEnabled
@@ -675,11 +746,12 @@ export function LaunchWindow() {
 							}`}
 							onClick={() =>
 								!recording &&
+								!streaming &&
 								setCursorCaptureMode(
 									cursorCaptureMode === "editable-overlay" ? "system" : "editable-overlay",
 								)
 							}
-							disabled={recording}
+							disabled={recording || streaming}
 							title={
 								cursorCaptureMode === "editable-overlay"
 									? t("cursor.useSystemCursor")
@@ -702,10 +774,12 @@ export function LaunchWindow() {
 							? paused
 								? "bg-amber-500/10 hover:bg-amber-500/15"
 								: "bg-red-500/12 hover:bg-red-500/16"
-							: "bg-white/[0.06] hover:bg-white/[0.10]"
+							: streaming
+								? "bg-white/[0.03] opacity-35"
+								: "bg-white/[0.06] hover:bg-white/[0.10]"
 					}`}
 					onClick={toggleRecording}
-					disabled={!hasSelectedSource && !recording}
+					disabled={streaming || (!hasSelectedSource && !recording)}
 					style={{ flex: "0 0 auto" }}
 				>
 					<div className={`flex items-center justify-center ${recording ? "gap-1.5" : ""}`}>
@@ -717,6 +791,29 @@ export function LaunchWindow() {
 								className={`${paused ? "text-amber-400" : "text-red-400"} inline-block w-[34px] text-left text-xs font-semibold tabular-nums`}
 							>
 								{formatTimePadded(elapsedSeconds)}
+							</span>
+						)}
+					</div>
+				</button>
+
+				{/* Live stream group */}
+				<button
+					data-testid="launch-live-stream-button"
+					className={`flex items-center justify-center rounded-full p-2 transition-[min-width,background-color] duration-150 ${streaming ? "min-w-[78px] bg-emerald-500/12 hover:bg-emerald-500/16" : "min-w-[36px] bg-white/[0.06] hover:bg-white/[0.10]"} ${recording ? "opacity-35" : ""} ${styles.electronNoDrag}`}
+					onClick={() => {
+						void openLiveStreamSetup();
+					}}
+					disabled={recording || liveSetupPreparing || (!hasSelectedSource && !streaming)}
+					style={{ flex: "0 0 auto" }}
+					title={streaming ? "Stop live stream" : "Start live stream"}
+				>
+					<div className={`flex items-center justify-center ${streaming ? "gap-1.5" : ""}`}>
+						{streaming
+							? getIcon("stop", "text-emerald-300")
+							: getIcon("live", hasSelectedSource ? "text-white/80" : "text-white/30")}
+						{streaming && (
+							<span className="inline-block w-[34px] text-left text-xs font-semibold tabular-nums text-emerald-300">
+								{formatTimePadded(streamElapsedSeconds)}
 							</span>
 						)}
 					</div>
@@ -749,7 +846,7 @@ export function LaunchWindow() {
 					</div>
 				)}
 
-				{!recording && (
+				{!recording && !streaming && (
 					<>
 						{/* Open video file */}
 						<Tooltip content={t("tooltips.openVideoFile")}>
@@ -859,6 +956,16 @@ export function LaunchWindow() {
 					</div>
 				</div>
 			</div>
+			<LiveStreamSetupDialog
+				open={liveSetupOpen}
+				onOpenChange={setLiveSetupOpen}
+				selectedSource={selectedSource}
+				webcamEnabled={webcamEnabled}
+				webcamDeviceId={webcamDeviceId}
+				layout={liveStreamLayout}
+				onLayoutChange={setLiveStreamLayout}
+				onStart={handleStartLiveStream}
+			/>
 		</div>
 	);
 }

@@ -2,6 +2,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -49,6 +50,21 @@ const RECORDING_SESSION_SUFFIX = ".session.json";
 const ALLOWED_IMPORT_VIDEO_EXTENSIONS = new Set([".webm", ".mp4", ".mov", ".avi", ".mkv"]);
 const PREVIEW_AUDIO_DIR = path.join(app.getPath("userData"), "preview-audio");
 const nativeMacCaptureEvents = new EventEmitter();
+const FFMPEG_LIVE_STREAM_AUDIO_BITRATE = "160k";
+const FFMPEG_LIVE_STREAM_FPS = "30";
+const FFMPEG_LIVE_STREAM_STOP_GRACE_MS = 2000;
+const nodeRequire = createRequire(import.meta.url);
+
+let liveStreamProcess: ChildProcessWithoutNullStreams | null = null;
+let liveStreamStopping = false;
+let liveStreamStderr = "";
+
+type StartLiveStreamInput = {
+	destinationUrl: string;
+	width: number;
+	height: number;
+	videoBitrateKbps: number;
+};
 
 /**
  * Paths explicitly approved by the user via file picker dialogs or project loads.
@@ -125,6 +141,108 @@ function runProcess(
 		child.on("error", reject);
 		child.on("close", (code) => resolve({ code, stdout, stderr }));
 	});
+}
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function serializeDesktopSource(source: DesktopCapturerSource): SelectedSource {
+	return {
+		id: source.id,
+		name: source.name,
+		display_id: source.display_id,
+		thumbnail: source.thumbnail ? source.thumbnail.toDataURL() : null,
+		appIcon: source.appIcon ? source.appIcon.toDataURL() : null,
+	};
+}
+
+function resolveFfmpegPath(): string | null {
+	try {
+		const ffmpegStaticPath = nodeRequire("ffmpeg-static");
+		return typeof ffmpegStaticPath === "string" && ffmpegStaticPath.length > 0
+			? ffmpegStaticPath
+			: null;
+	} catch (error) {
+		console.error("Failed to resolve bundled FFmpeg path:", error);
+		return null;
+	}
+}
+
+function waitForLiveStreamExit(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+	const proc = liveStreamProcess;
+	if (!proc) {
+		return Promise.resolve({ code: null, signal: null });
+	}
+
+	return new Promise((resolve) => {
+		proc.once("close", (code, signal) => {
+			resolve({ code, signal });
+		});
+	});
+}
+
+function liveStreamStopTimeout(ms: number) {
+	return new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+		setTimeout(() => resolve({ code: null, signal: null }), ms);
+	});
+}
+
+async function stopLiveStreamProcess() {
+	const proc = liveStreamProcess;
+	if (!proc) {
+		liveStreamStopping = false;
+		liveStreamStderr = "";
+		return { success: true };
+	}
+
+	liveStreamStopping = true;
+	const exitPromise = waitForLiveStreamExit();
+
+	if (!proc.stdin.destroyed) {
+		proc.stdin.end();
+	}
+
+	let timeoutId: ReturnType<typeof setTimeout> | null = null;
+	const timeoutPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+		(resolve) => {
+			timeoutId = setTimeout(() => {
+				if (!proc.killed) {
+					proc.kill("SIGTERM");
+				}
+				resolve({ code: null, signal: "SIGTERM" });
+			}, 5000);
+		},
+	);
+	const result = await Promise.race([exitPromise, timeoutPromise]);
+	if (timeoutId) {
+		clearTimeout(timeoutId);
+	}
+	const finalResult =
+		result.signal === "SIGTERM" && liveStreamProcess === proc
+			? await Promise.race([exitPromise, liveStreamStopTimeout(FFMPEG_LIVE_STREAM_STOP_GRACE_MS)])
+			: result;
+
+	const timedOutWhileStopping = finalResult.code === null && finalResult.signal === null;
+	if (!timedOutWhileStopping && liveStreamProcess === proc) {
+		liveStreamProcess = null;
+	}
+	liveStreamStopping = false;
+	const stderr = liveStreamStderr;
+	liveStreamStderr = "";
+
+	if (finalResult.code === 0 || finalResult.signal === "SIGTERM") {
+		return { success: true };
+	}
+
+	return {
+		success: false,
+		error:
+			stderr.trim() ||
+			(timedOutWhileStopping
+				? "Timed out while stopping live stream process."
+				: `FFmpeg exited with code ${finalResult.code ?? "unknown"}`),
+	};
 }
 
 function parseAfinfoAudioTrackBitrates(output: string): number[] {
@@ -1267,13 +1385,7 @@ export function registerIpcHandlers(
 	ipcMain.handle("get-sources", async (_, opts) => {
 		const sources = await desktopCapturer.getSources(opts);
 		lastEnumeratedSources = new Map(sources.map((source) => [source.id, source]));
-		return sources.map((source) => ({
-			id: source.id,
-			name: source.name,
-			display_id: source.display_id,
-			thumbnail: source.thumbnail ? source.thumbnail.toDataURL() : null,
-			appIcon: source.appIcon ? source.appIcon.toDataURL() : null,
-		}));
+		return sources.map(serializeDesktopSource);
 	});
 
 	ipcMain.handle("select-source", async (_, source: SelectedSource) => {
@@ -1305,6 +1417,70 @@ export function registerIpcHandlers(
 
 	ipcMain.handle("get-selected-source", () => {
 		return selectedSource;
+	});
+
+	// Refresh the setup-dialog thumbnail without capturing OpenScreen's own HUD.
+	// For full-screen sources we temporarily hide app-owned overlay windows before
+	// asking Electron for a new desktop thumbnail, then restore them immediately.
+	ipcMain.handle("capture-selected-source-preview", async () => {
+		if (!selectedSource?.id) {
+			return null;
+		}
+
+		const isScreenSource = selectedSource.id.startsWith("screen:");
+		const mainWin = getMainWindow();
+		const sourceSelectorWin = getSourceSelectorWindow();
+		const shouldHideMainWin =
+			isScreenSource && mainWin && !mainWin.isDestroyed() && mainWin.isVisible();
+		const shouldHideSourceSelectorWin =
+			isScreenSource &&
+			sourceSelectorWin &&
+			!sourceSelectorWin.isDestroyed() &&
+			sourceSelectorWin.isVisible();
+
+		try {
+			if (shouldHideMainWin) {
+				mainWin.hide();
+			}
+			if (shouldHideSourceSelectorWin) {
+				sourceSelectorWin.hide();
+			}
+
+			if (shouldHideMainWin || shouldHideSourceSelectorWin) {
+				await delay(180);
+			}
+
+			const sources = await desktopCapturer.getSources({
+				types: [isScreenSource ? "screen" : "window"],
+				thumbnailSize: { width: 1280, height: 720 },
+				fetchWindowIcons: true,
+			});
+			lastEnumeratedSources = new Map(sources.map((source) => [source.id, source]));
+			const refreshedSource =
+				lastEnumeratedSources.get(selectedSource.id) ??
+				sources.find(
+					(source) =>
+						source.display_id &&
+						selectedSource?.display_id &&
+						source.display_id === selectedSource.display_id,
+				) ??
+				null;
+
+			if (!refreshedSource) {
+				return selectedSource;
+			}
+
+			selectedDesktopSource = refreshedSource;
+			selectedSource = serializeDesktopSource(refreshedSource);
+			return selectedSource;
+		} finally {
+			if (shouldHideSourceSelectorWin && sourceSelectorWin && !sourceSelectorWin.isDestroyed()) {
+				sourceSelectorWin.showInactive();
+			}
+			if (shouldHideMainWin && mainWin && !mainWin.isDestroyed()) {
+				mainWin.showInactive();
+			}
+		}
 	});
 
 	ipcMain.handle("request-camera-access", async () => {
@@ -2613,6 +2789,140 @@ export function registerIpcHandlers(
 
 	ipcMain.handle("get-platform", () => {
 		return process.platform;
+	});
+
+	ipcMain.handle("start-live-stream", async (_, input: StartLiveStreamInput) => {
+		if (liveStreamProcess) {
+			return { success: false, error: "A live stream is already running." };
+		}
+
+		const ffmpegPath = resolveFfmpegPath();
+		if (!ffmpegPath) {
+			return { success: false, error: "Bundled FFmpeg is not available." };
+		}
+
+		const width = Number.isFinite(input.width) ? Math.max(2, Math.round(input.width)) : 1920;
+		const height = Number.isFinite(input.height) ? Math.max(2, Math.round(input.height)) : 1080;
+		const videoBitrateKbps = Number.isFinite(input.videoBitrateKbps)
+			? Math.max(500, Math.round(input.videoBitrateKbps))
+			: 6000;
+		const destinationUrl = String(input.destinationUrl ?? "").trim();
+		const lowerDestinationUrl = destinationUrl.toLowerCase();
+		const keyframeInterval = String(Number(FFMPEG_LIVE_STREAM_FPS) * 2);
+
+		if (!lowerDestinationUrl.startsWith("rtmp://") && !lowerDestinationUrl.startsWith("rtmps://")) {
+			return { success: false, error: "Destination URL must start with rtmp:// or rtmps://." };
+		}
+
+		liveStreamStopping = false;
+		liveStreamStderr = "";
+
+		const args = [
+			"-hide_banner",
+			"-loglevel",
+			"warning",
+			"-fflags",
+			"+genpts",
+			"-i",
+			"pipe:0",
+			"-vf",
+			`scale=${width}:${height}:flags=lanczos,format=yuv420p`,
+			"-r",
+			FFMPEG_LIVE_STREAM_FPS,
+			"-c:v",
+			"libx264",
+			"-preset",
+			"veryfast",
+			"-tune",
+			"zerolatency",
+			"-g",
+			keyframeInterval,
+			"-keyint_min",
+			keyframeInterval,
+			"-sc_threshold",
+			"0",
+			"-b:v",
+			`${videoBitrateKbps}k`,
+			"-maxrate",
+			`${videoBitrateKbps}k`,
+			"-bufsize",
+			`${videoBitrateKbps * 2}k`,
+			"-c:a",
+			"aac",
+			"-b:a",
+			FFMPEG_LIVE_STREAM_AUDIO_BITRATE,
+			"-ar",
+			"48000",
+			"-flvflags",
+			"no_duration_filesize",
+			"-f",
+			"flv",
+			destinationUrl,
+		];
+
+		const proc = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+		liveStreamProcess = proc;
+
+		proc.stderr.on("data", (chunk) => {
+			liveStreamStderr += chunk.toString();
+			if (liveStreamStderr.length > 8000) {
+				liveStreamStderr = liveStreamStderr.slice(-8000);
+			}
+		});
+
+		proc.once("error", (error) => {
+			if (liveStreamProcess === proc) {
+				liveStreamProcess = null;
+			}
+			liveStreamStderr = String(error);
+		});
+
+		proc.once("close", (code) => {
+			if (liveStreamProcess === proc) {
+				liveStreamProcess = null;
+			}
+			if (!liveStreamStopping && code !== 0) {
+				console.error("Live stream FFmpeg process exited:", liveStreamStderr);
+			}
+			liveStreamStopping = false;
+		});
+
+		return { success: true };
+	});
+
+	ipcMain.handle("write-live-stream-chunk", async (_, chunk: ArrayBuffer) => {
+		const proc = liveStreamProcess;
+		if (!proc || proc.stdin.destroyed) {
+			return {
+				success: false,
+				error: liveStreamStderr.trim() || "Live stream is not running.",
+			};
+		}
+
+		const buffer = Buffer.from(new Uint8Array(chunk));
+		if (buffer.length === 0) {
+			return { success: true };
+		}
+
+		return await new Promise<{ success: boolean; error?: string }>((resolve) => {
+			const onError = (error: Error) => {
+				resolve({ success: false, error: error.message });
+			};
+			proc.stdin.once("error", onError);
+			const flushed = proc.stdin.write(buffer, () => {
+				proc.stdin.off("error", onError);
+				resolve({ success: true });
+			});
+			if (!flushed) {
+				proc.stdin.once("drain", () => {
+					proc.stdin.off("error", onError);
+				});
+			}
+		});
+	});
+
+	ipcMain.handle("stop-live-stream", async () => {
+		return await stopLiveStreamProcess();
 	});
 
 	ipcMain.handle("get-shortcuts", async () => {

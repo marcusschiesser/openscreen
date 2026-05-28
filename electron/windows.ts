@@ -17,6 +17,12 @@ const ASSET_BASE_DIR = process.defaultApp
 const ASSET_BASE_URL_ARG = `--asset-base-url=${pathToFileURL(`${ASSET_BASE_DIR}${path.sep}`).toString()}`;
 
 let hudOverlayWindow: BrowserWindow | null = null;
+let hudOverlayCompactBounds: Electron.Rectangle | null = null;
+
+const HUD_COMPACT_WIDTH = 600;
+const HUD_COMPACT_HEIGHT = 160;
+const HUD_EXPANDED_WIDTH = 1000;
+const HUD_EXPANDED_HEIGHT = 760;
 
 ipcMain.on("hud-overlay-hide", () => {
 	if (hudOverlayWindow && !hudOverlayWindow.isDestroyed()) {
@@ -44,6 +50,46 @@ ipcMain.on("hud-overlay-move-by", (_event, deltaX: number, deltaY: number) => {
 	hudOverlayWindow.setPosition(Math.round(x + deltaX), Math.round(y + deltaY), false);
 });
 
+ipcMain.on("hud-overlay-expanded", (_event, expanded: boolean) => {
+	if (!hudOverlayWindow || hudOverlayWindow.isDestroyed()) {
+		return;
+	}
+
+	const { workArea } = screen.getDisplayMatching(hudOverlayWindow.getBounds());
+
+	if (expanded) {
+		if (!hudOverlayCompactBounds) {
+			hudOverlayCompactBounds = hudOverlayWindow.getBounds();
+		}
+
+		const width = Math.min(HUD_EXPANDED_WIDTH, workArea.width);
+		const height = Math.min(HUD_EXPANDED_HEIGHT, workArea.height);
+		hudOverlayWindow.setMinimumSize(width, height);
+		hudOverlayWindow.setMaximumSize(width, height);
+		hudOverlayWindow.setBounds(
+			{
+				x: Math.round(workArea.x + (workArea.width - width) / 2),
+				y: Math.round(workArea.y + (workArea.height - height) / 2),
+				width,
+				height,
+			},
+			false,
+		);
+		return;
+	}
+
+	const compactBounds = hudOverlayCompactBounds ?? {
+		width: HUD_COMPACT_WIDTH,
+		height: HUD_COMPACT_HEIGHT,
+		x: Math.floor(workArea.x + (workArea.width - HUD_COMPACT_WIDTH) / 2),
+		y: Math.floor(workArea.y + workArea.height - HUD_COMPACT_HEIGHT - 5),
+	};
+	hudOverlayWindow.setMinimumSize(HUD_COMPACT_WIDTH, HUD_COMPACT_HEIGHT);
+	hudOverlayWindow.setMaximumSize(HUD_COMPACT_WIDTH, HUD_COMPACT_HEIGHT);
+	hudOverlayWindow.setBounds(compactBounds, false);
+	hudOverlayCompactBounds = null;
+});
+
 /**
  * Creates the always-on-top HUD overlay window centred at the bottom of the
  * primary display. The window is frameless, transparent, and follows the user
@@ -53,8 +99,8 @@ export function createHudOverlayWindow(): BrowserWindow {
 	const primaryDisplay = screen.getPrimaryDisplay();
 	const { workArea } = primaryDisplay;
 
-	const windowWidth = 600;
-	const windowHeight = 160;
+	const windowWidth = HUD_COMPACT_WIDTH;
+	const windowHeight = HUD_COMPACT_HEIGHT;
 
 	const x = Math.floor(workArea.x + (workArea.width - windowWidth) / 2);
 	const y = Math.floor(workArea.y + workArea.height - windowHeight - 5);

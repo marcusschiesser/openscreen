@@ -25,6 +25,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	setHudOverlayIgnoreMouseEvents: (ignore: boolean) => {
 		ipcRenderer.send("hud-overlay-ignore-mouse-events", ignore);
 	},
+	setHudOverlayExpanded: (expanded: boolean) => {
+		ipcRenderer.send("hud-overlay-expanded", expanded);
+	},
 	moveHudOverlayBy: (deltaX: number, deltaY: number) => {
 		ipcRenderer.send("hud-overlay-move-by", deltaX, deltaY);
 	},
@@ -48,6 +51,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	},
 	getSelectedSource: () => {
 		return ipcRenderer.invoke("get-selected-source");
+	},
+	captureSelectedSourcePreview: () => {
+		return ipcRenderer.invoke("capture-selected-source-preview");
 	},
 	requestCameraAccess: () => {
 		return ipcRenderer.invoke("request-camera-access");
@@ -177,6 +183,20 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	},
 	getPlatform: () => {
 		return ipcRenderer.invoke("get-platform");
+	},
+	startLiveStream: (input: {
+		destinationUrl: string;
+		width: number;
+		height: number;
+		videoBitrateKbps: number;
+	}) => {
+		return ipcRenderer.invoke("start-live-stream", input);
+	},
+	writeLiveStreamChunk: (chunk: ArrayBuffer) => {
+		return ipcRenderer.invoke("write-live-stream-chunk", chunk);
+	},
+	stopLiveStream: () => {
+		return ipcRenderer.invoke("stop-live-stream");
 	},
 	revealInFolder: (filePath: string) => {
 		return ipcRenderer.invoke("reveal-in-folder", filePath);

@@ -43,6 +43,7 @@ interface Window {
 		}>;
 		selectSource: (source: ProcessedDesktopSource) => Promise<ProcessedDesktopSource | null>;
 		getSelectedSource: () => Promise<ProcessedDesktopSource | null>;
+		captureSelectedSourcePreview: () => Promise<ProcessedDesktopSource | null>;
 		requestCameraAccess: () => Promise<{
 			success: boolean;
 			granted: boolean;
@@ -235,6 +236,14 @@ interface Window {
 		onMenuSaveProject: (callback: () => void) => () => void;
 		onMenuSaveProjectAs: (callback: () => void) => () => void;
 		getPlatform: () => Promise<string>;
+		startLiveStream: (input: {
+			destinationUrl: string;
+			width: number;
+			height: number;
+			videoBitrateKbps: number;
+		}) => Promise<{ success: boolean; error?: string }>;
+		writeLiveStreamChunk: (chunk: ArrayBuffer) => Promise<{ success: boolean; error?: string }>;
+		stopLiveStream: () => Promise<{ success: boolean; error?: string }>;
 		revealInFolder: (
 			filePath: string,
 		) => Promise<{ success: boolean; error?: string; message?: string }>;
@@ -243,6 +252,7 @@ interface Window {
 		hudOverlayHide: () => void;
 		hudOverlayClose: () => void;
 		setHudOverlayIgnoreMouseEvents: (ignore: boolean) => void;
+		setHudOverlayExpanded: (expanded: boolean) => void;
 		moveHudOverlayBy: (deltaX: number, deltaY: number) => void;
 		showCountdownOverlay: (value: number, runId: number) => Promise<void>;
 		setCountdownOverlayValue: (value: number, runId: number) => Promise<void>;
